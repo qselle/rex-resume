@@ -13,14 +13,25 @@
 local TERMINAL = "com.superlogical.terminal"
 local LABEL = "rex-resume"
 local HOME = os.getenv("HOME")
-local PANES = (os.getenv("XDG_STATE_HOME") or HOME .. "/.local/state") .. "/rex-resume/panes"
+local STATE = (os.getenv("XDG_STATE_HOME") or HOME .. "/.local/state") .. "/rex-resume"
 -- vibe's session store: who holds each conversation, and what it is.
 local VIBE = (os.getenv("VIBE_HOME") or HOME .. "/.vibe") .. "/logs/session"
 
-local instance -- this server's instance_id: a record from another one survived a restart
+-- Shells whose syntax the typed line uses: `cd '…' && vibe …`.
+local SHELLS = { zsh = true, bash = true, fish = true, sh = true, dash = true, ksh = true, mksh = true }
+-- A restored pane is resumed only this soon after the server started. A
+-- watcher that starts later (it failed to start, then a reload) must not type
+-- into panes that have been in use since.
+local RESUME_WINDOW = 60
 
+local instance -- this server's instance_id: a record from another one survived a restart
+local started  -- when this server started, in seconds since the epoch
+local panes    -- this server's records: STATE/panes/<host_id>, one folder per Rex server
+
+-- Control characters (from a folder name) are written as "?": the log is read
+-- in terminals.
 local function log(...)
-  io.write(os.date("%Y-%m-%dT%H:%M:%S "), table.concat({ ... }, " "), "\n")
+  io.write(os.date("%Y-%m-%dT%H:%M:%S "), (table.concat({ ... }, " "):gsub("%c", "?")), "\n")
   io.flush()
 end
 
@@ -35,7 +46,7 @@ local function read_json(path)
 end
 
 local function record_path(block)
-  return PANES .. "/" .. (block:gsub("^block:", "")) .. ".json"
+  return panes .. "/" .. (block:gsub("^block:", "")) .. ".json"
 end
 
 local function load(block)
@@ -182,7 +193,7 @@ end
 local function resume(session_id, block, rec, tries)
   local p = process(session_id, block)
   if p == nil then return end
-  if not at_prompt(p) then
+  if not (at_prompt(p) and SHELLS[p.child.name]) then
     -- The restored shell is still starting (its rc files run commands too):
     -- wait for its prompt, and give up if the pane runs something else by then.
     if (tries or 0) < 20 then
@@ -196,13 +207,21 @@ local function resume(session_id, block, rec, tries)
   if rec.session and rec.session:match("^[%w-]+$") and read_json(VIBE .. "/unified/" .. rec.session .. "/meta.json") then
     cmd = "vibe --resume " .. rec.session
   end
-  local cd = is_dir(rec.cwd) and "cd " .. quote(rec.cwd) .. " && " or ""
+  -- The line is typed, so the line editor reads every byte as a key: a folder
+  -- name holding control characters (C0, DEL, C1) could type a command of its
+  -- own. Such a folder is skipped, and vibe resumes wherever the shell is.
+  local cd = ""
+  if rec.cwd and not rec.cwd:find("%c") and not rec.cwd:find("\194[\128-\159]") and is_dir(rec.cwd) then
+    cd = "cd " .. quote(rec.cwd) .. " && "
+  end
   rec.instance, rec.resuming, rec.pid = instance, os.time(), nil
   save(block, rec)
-  -- Typed as by hand; the leading space keeps it out of a history that ignores
-  -- such lines (zsh's hist_ignore_space, bash's ignorespace).
+  -- Typed as by hand: Ctrl-U first clears anything already typed at the
+  -- prompt, so it can't run glued to ours. The leading space keeps the line
+  -- out of a history that ignores such lines (zsh's hist_ignore_space, bash's
+  -- ignorespace).
   local _, err = rex.block.call(TERMINAL, "write", {
-    session_id = session_id, block_id = block, data = " " .. cd .. cmd .. "\r",
+    session_id = session_id, block_id = block, data = "\21 " .. cd .. cmd .. "\r",
   })
   log("resume", block, rec.cwd or "?", cmd, err or "")
 end
@@ -211,7 +230,8 @@ end
 
 -- One watcher per server: the newest, so `rex config reload` runs new code.
 local function take_over()
-  local me = rex.call("server.whoami", {}).principal.pid
+  local who = rex.call("server.whoami", {}).principal
+  local me = who.pid
   rex.call("client.set_label", { label = LABEL })
   local clients = (rex.call("client.list", {}) or {}).clients or {}
   local mine
@@ -220,7 +240,9 @@ local function take_over()
   end
   for _, c in ipairs(clients) do
     local pid = c.principal and c.principal.pid
-    if c.info and c.info.label == LABEL and pid and pid ~= me and mine and c.client_id < mine then
+    -- Only an older watcher: a CLI client of this account on this machine.
+    if c.info and c.info.label == LABEL and c.info.kind == "cli" and c.principal.transport == "unix"
+      and c.principal.uid == who.uid and pid and pid ~= me and mine and c.client_id < mine then
       rex.exec { "kill", tostring(pid) }
       log("replaced watcher", tostring(pid))
     end
@@ -241,23 +263,53 @@ local function reconcile()
         if vibe then
           note(b.block_id, vibe, rec)
         elseif rec and rec.instance ~= instance then
-          resume(s.session_id, b.block_id, rec)
+          if started and os.time() - started < RESUME_WINDOW then
+            resume(s.session_id, b.block_id, rec)
+          else
+            forget(b.block_id, "server started too long ago to resume")
+          end
         elseif rec and not resuming(rec) then
           forget(b.block_id, "vibe quit while unwatched")
         end
       end
     end
   end
-  for _, name in ipairs(list(PANES)) do
+  for _, name in ipairs(list(panes)) do
     local block = "block:" .. (name:match("^(.+)%.json$") or "")
     if not live[block] then forget(block, "pane gone") end
   end
 end
 
+-- An RFC 3339 time ("2026-11-20T18:38:36.32Z", or with an offset) in seconds
+-- since the epoch, or nil. Plain arithmetic: os.time would read the fields as
+-- local time, daylight saving included.
+local function epoch(stamp)
+  local y, mo, d, h, mi, s, zone = (stamp or ""):match("^(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)[%d.]*(.*)$")
+  if not y then return nil end
+  local offset = 0
+  local sign, zh, zm = zone:match("^([+-])(%d%d):?(%d%d)$")
+  if sign then
+    offset = (sign == "+" and 1 or -1) * (tonumber(zh) * 3600 + tonumber(zm) * 60)
+  elseif zone ~= "Z" then
+    return nil
+  end
+  y, mo = tonumber(y), tonumber(mo)
+  -- Days since 1970-01-01 (H. Hinnant's days_from_civil).
+  if mo <= 2 then y = y - 1 end
+  local era = math.floor(y / 400)
+  local yoe = y - era * 400
+  local doy = math.floor((153 * ((mo + 9) % 12) + 2) / 5) + tonumber(d) - 1
+  local days = era * 146097 + yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy - 719468
+  return days * 86400 + tonumber(h) * 3600 + tonumber(mi) * 60 + tonumber(s) - offset
+end
+
 local status = assert(rex.call("server.status", {}))
 instance = status.instance_id
-local made = rex.exec { "mkdir", "-p", "-m", "700", PANES }
-if not (made and made.ok) then error("cannot create " .. PANES, 0) end
+started = epoch(status.started_at)
+panes = STATE .. "/panes/" .. assert(status.host_id, "server has no host_id")
+local made = rex.exec { "mkdir", "-p", panes }
+if not (made and made.ok) then error("cannot create " .. panes, 0) end
+rex.exec { "chmod", "700", STATE }
 
 rex.on("terminal.process_changed", function(ctx, ev)
   if find_vibe(ev.foreground, ev.ancestors) or has_record(ctx.block_id) then
@@ -277,7 +329,7 @@ end)
 
 -- Session calls work once the script listens, not at its top level.
 rex.after(0, function()
-  log("watching", "server " .. instance)
+  log("watching", "server " .. instance, started and "" or "(start time unknown: no resume)")
   take_over()
   reconcile()
 end)
