@@ -1,6 +1,7 @@
--- rex-resume: the Rex server starts the watcher (rex-resume.lua) each time it
--- loads its configuration: at startup and on `rex config reload` (the new
--- watcher replaces the old one). Load this file from Rex's init.lua:
+-- rex-resume: the Rex server starts the watcher (rex-resume.lua, in this
+-- file's folder) each time it loads its configuration: at startup and on
+-- `rex config reload` (the new watcher replaces the old one). Use this file as
+-- Rex's init.lua, or load it from yours:
 --   dofile(os.getenv("HOME") .. "/.rex-resume/init.lua")
 -- The watcher logs to ~/.local/state/rex-resume/watcher.log.
 

@@ -18,6 +18,13 @@ rex config reload
 
 Rex's configuration file is `$XDG_CONFIG_HOME/rex/init.lua` when that is set, or the file `REX_CONFIG` names. The vibe already running in your panes is picked up at once.
 
+With Rex's Home Manager module, `init.lua` can be the launcher itself, next to the watcher (then `rex config reload` after a switch):
+
+```nix
+programs.rex.config = ./rex-resume/init.lua;
+xdg.configFile."rex/rex-resume.lua".source = ./rex-resume/rex-resume.lua;
+```
+
 **Coming from the zsh plugin?** Remove its `source` line (or `rex-resume` from oh-my-zsh's `plugins`) first. Otherwise both reopen vibe.
 
 Update: `git -C ~/.rex-resume pull && rex config reload`, which replaces the running watcher.
