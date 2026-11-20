@@ -141,13 +141,10 @@ local function note(block, vibe, rec)
   if session == nil and rec and (rec.pid == vibe.pid or resuming(rec)) then
     session = rec.session -- not found this time (vibe still starting up): keep it
   end
-  local new = { pid = vibe.pid, cwd = vibe.cwd, session = session, instance = instance }
-  if rec and rec.pid == new.pid and rec.cwd == new.cwd and rec.session == new.session
-    and rec.instance == new.instance and not rec.resuming then
-    return
+  save(block, { pid = vibe.pid, cwd = vibe.cwd, session = session, instance = instance })
+  if not rec or rec.session ~= session or rec.cwd ~= vibe.cwd then
+    log("note", block, vibe.cwd or "?", session or "(no message yet)")
   end
-  save(block, new)
-  log("note", block, new.cwd or "?", new.session or "(no message yet)")
 end
 
 -- What a pane runs now, asked of the server rather than taken from an event.
@@ -171,12 +168,6 @@ local function poke(session_id, block)
     pending[block] = nil
     refresh(session_id, block)
   end)
-end
-
-local function has_record(block)
-  local f = io.open(record_path(block))
-  if f then f:close() end
-  return f ~= nil
 end
 
 -- Resuming -------------------------------------------------------------------
@@ -280,27 +271,19 @@ local function reconcile()
   end
 end
 
--- An RFC 3339 time ("2026-11-20T18:38:36.32Z", or with an offset) in seconds
--- since the epoch, or nil. Plain arithmetic: os.time would read the fields as
--- local time, daylight saving included.
+-- The server's start time ("2026-11-20T18:38:36.32Z", UTC) in seconds since
+-- the epoch, or nil. Plain arithmetic (days_from_civil): os.time would read the
+-- fields as local time.
 local function epoch(stamp)
-  local y, mo, d, h, mi, s, zone = (stamp or ""):match("^(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)[%d.]*(.*)$")
+  local y, mo, d, h, mi, s = (stamp or ""):match("^(%d+)-(%d+)-(%d+)T(%d+):(%d+):(%d+)[%d.]*Z$")
   if not y then return nil end
-  local offset = 0
-  local sign, zh, zm = zone:match("^([+-])(%d%d):?(%d%d)$")
-  if sign then
-    offset = (sign == "+" and 1 or -1) * (tonumber(zh) * 3600 + tonumber(zm) * 60)
-  elseif zone ~= "Z" then
-    return nil
-  end
   y, mo = tonumber(y), tonumber(mo)
-  -- Days since 1970-01-01 (H. Hinnant's days_from_civil).
   if mo <= 2 then y = y - 1 end
   local era = math.floor(y / 400)
   local yoe = y - era * 400
   local doy = math.floor((153 * ((mo + 9) % 12) + 2) / 5) + tonumber(d) - 1
   local days = era * 146097 + yoe * 365 + math.floor(yoe / 4) - math.floor(yoe / 100) + doy - 719468
-  return days * 86400 + tonumber(h) * 3600 + tonumber(mi) * 60 + tonumber(s) - offset
+  return days * 86400 + tonumber(h) * 3600 + tonumber(mi) * 60 + tonumber(s)
 end
 
 local status = assert(rex.call("server.status", {}))
@@ -312,14 +295,14 @@ if not (made and made.ok) then error("cannot create " .. panes, 0) end
 rex.exec { "chmod", "700", STATE }
 
 rex.on("terminal.process_changed", function(ctx, ev)
-  if find_vibe(ev.foreground, ev.ancestors) or has_record(ctx.block_id) then
+  if find_vibe(ev.foreground, ev.ancestors) or load(ctx.block_id) then
     poke(ctx.session_id, ctx.block_id)
   end
 end)
 -- vibe reports its state (OSC 7501) as it works and when it switches
 -- conversation: the moment to look its session up again.
 rex.on("terminal.program_status_changed", function(ctx, ev)
-  if (ev.record and ev.record.app == "vibe") or has_record(ctx.block_id) then
+  if (ev.record and ev.record.app == "vibe") or load(ctx.block_id) then
     poke(ctx.session_id, ctx.block_id)
   end
 end)
