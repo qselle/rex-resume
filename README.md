@@ -1,72 +1,84 @@
 # rex-resume
 
-Reopens your [vibe](https://github.com/mistralai/mistral-vibe) conversations in their [Rex](https://www.superlogical.com/rex) panes after the Rex server restarts (upgrade, reboot).
+Reopens your [vibe](https://github.com/mistralai/mistral-vibe) conversations in their [Rex](https://www.superlogical.com/rex) panes after the Rex server restarts: an upgrade, a reboot, or a crash.
 
-Rex already brings back your sessions, tabs and splits, but as fresh shells. With rex-resume, each pane that was running vibe types `vibe --resume <its session>` by itself.
+Rex already brings back your sessions, tabs and splits, but as fresh shells. With rex-resume, each pane that was running vibe types `vibe --resume <its conversation>` by itself.
+
+It is a [Rex Lua script](https://www.superlogical.com/rex/docs/automate/lua-scripts) that the Rex server starts and that follows Rex's [events](https://www.superlogical.com/rex/docs/reference/events). It needs no shell setup.
 
 ## Install
 
-zsh, on macOS or Linux, on the machine that runs the Rex server:
+On the machine that runs the Rex server (macOS or Linux):
 
 ```sh
-git clone git@github.com:qselle/rex-resume.git ~/.rex-resume
-echo 'source ~/.rex-resume/rex-resume.plugin.zsh' >> ~/.zshrc
+git clone https://github.com/qselle/rex-resume.git ~/.rex-resume
+echo 'dofile(os.getenv("HOME") .. "/.rex-resume/init.lua")' >> ~/.config/rex/init.lua
+rex config reload
 ```
 
-With oh-my-zsh, clone it into `$ZSH_CUSTOM/plugins/rex-resume` instead and add `rex-resume` to `plugins=(...)`.
+Rex's configuration file is `$XDG_CONFIG_HOME/rex/init.lua` when that is set, or the file `REX_CONFIG` names. The vibe already running in your panes is picked up at once.
 
-Then open new panes (or run `exec zsh` in the existing ones) and start vibe there. Only vibe started after that comes back.
+**Coming from the zsh plugin?** Remove its `source` line (or `rex-resume` from oh-my-zsh's `plugins`) first. Otherwise both reopen vibe.
 
-Update: `git -C ~/.rex-resume pull`. Uninstall: remove the `source` line and `~/.rex-resume`.
-
-**Not on zsh?** Add this one line to your shell's startup file instead. After a restart, run `vibe -c` in each pane: each gets its own conversation back.
-
-```sh
-[ -n "$REX_BLOCK" ] && export VIBE_TERMINAL_KEY="$REX_BLOCK"
-```
+Update: `git -C ~/.rex-resume pull && rex config reload`, which replaces the running watcher.
+Uninstall: remove the `dofile` line, then run `pkill -f 'do --all .*rex-resume.lua'` and `rm -rf ~/.rex-resume ~/.local/state/rex-resume`.
 
 ## How it works
 
-Each Rex pane has a permanent ID (`$REX_BLOCK`) that survives restarts. vibe's memory and rex-resume's note are both filed under it.
+Each Rex pane has a permanent ID that survives restarts. The watcher keeps a record for each pane running vibe, and updates it as things happen, not at shutdown.
 
 ```
+Rex server starts → init.lua → rex do --all rex-resume.lua   (the watcher, one per server)
+
 1. While you work
 ┌─ Rex pane  ID = 7f3a ────────────────┐
-│ $ vibe                               │
-│   ↳ shell leaves a note: ────────────┼──▶ ~/.local/state/rex-resume/7f3a
-│     "vibe, ~/src/app"                │      vibe
-│                                      │      ~/src/app
-│ vibe remembers its session: ─────────┼──▶ ~/.vibe/logs/session/continue-pointers/
-│   "pane 7f3a + ~/src/app → d90dff3e" │     (VIBE_TERMINAL_KEY = pane ID)
+│ $ vibe                               │  terminal.process_changed: vibe-rs in front
+│   … /resume, /new …                  │  terminal.program_status_changed: vibe reports (OSC 7501)
 └──────────────────────────────────────┘
+   ↳ the watcher asks vibe which conversation it has open (the lock its app server holds)
+   ↳ ~/.local/state/rex-resume/panes/7f3a.json
+        { cwd: ~/src/app, session: d90dff3e, instance: <this server's instance> }
 
-2a. You quit vibe        → prompt returns → note deleted (nothing to reopen)
-2b. Rex server stops     → vibe and shell killed → note stays
+2a. You quit vibe                         → the pane's shell is back in front → record deleted
+2b. The server stops, crashes, is killed  → no event; the watcher ends with it → record stays
 
-3. Rex comes back: same layout, same pane IDs, fresh shells
-┌─ pane 7f3a (new shell) ─────────────────────────┐
-│ note for 7f3a?            → vibe, ~/src/app     │
-│ vibe's session for 7f3a?  → d90dff3e            │
-│ $ cd ~/src/app && vibe --resume d90dff3e        │  ← typed for you
-└─────────────────────────────────────────────────┘
+3. Rex comes back: same layout, same pane IDs, fresh shells; init.lua starts a new watcher
+┌─ pane 7f3a (new shell) ───────────────────────────────┐
+│ record from another server instance, shell at prompt  │
+│ $ cd ~/src/app && vibe --resume d90dff3e              │  ← typed for you
+└───────────────────────────────────────────────────────┘
 ```
 
 | Who | Does what |
 |---|---|
-| Rex | Restores layout and pane IDs (built in) |
-| vibe | Remembers each terminal's last session for `vibe -c` (built in; rex-resume sets the terminal key to the pane ID) |
-| rex-resume | Leaves the note, reopens vibe |
+| Rex | Restores the layout and the pane IDs, starts the watcher (`init.lua`), reports what each pane runs |
+| vibe | Holds a lock on the conversation it has open, reports its status |
+| rex-resume | Keeps the records, and reopens vibe in restored panes |
+
+### Why not save at shutdown
+
+Another way to do this is a hook that saves which pane runs which conversation when the server stops (an `ExecStop=` on `rex.service`), and a job that replays the list after it starts. rex-resume keeps its records current instead:
+
+| | Save at shutdown | rex-resume |
+|---|---|---|
+| `systemctl stop` or `restart rex` | Saved | Already recorded |
+| Crash, OOM kill, `kill -9`, power loss | Nothing saved: the server is gone by the time the hook runs, or nothing runs at all | Already recorded |
+| `rex server stop`, or a restart from the Rex app | Nothing saved: the server exits first, and systemd runs the hook after | Already recorded |
+| Where it lives | Two systemd units, Linux only | Rex's `init.lua`, macOS or Linux |
 
 ## Limits
 
-- Only `vibe` typed at the pane's prompt is noted: not `rex run -- vibe`, `cd x && vibe`, `--workdir` or `--worktree`, nor vibe in a shell nested in the pane.
+- It relies on vibe internals: the `vibe-rs` process name, and the session store under `~/.vibe/logs/session`. That store holds `active/<id>.lock.json`, the lock held by vibe's app server, and `unified/<id>/meta.json`. Tested with vibe 3.1.4. If an update changes them, panes reopen a new vibe rather than the conversation. A custom `session_logging.save_dir` isn't supported.
+- It relies on Rex's preview API: `rex do --all`, plus the terminal's `process` and `write` methods and `process_changed` events. Tested with Rex 0.1.0-preview.22 (API revision 19).
+- `rex` must be on the Rex server's `PATH`. The watcher reads `VIBE_HOME` and `XDG_STATE_HOME` from the server's environment, not from your shell's.
+- While no watcher runs (it was killed), nothing is noted. The next watcher catches up on what it can see: vibe running now, and panes that closed.
+- A pane that runs something other than its shell's prompt for 10 seconds after a restore is left alone.
+- A pane started with a command (`rex run -- vibe`) comes back however Rex restores it.
 - A reply vibe was writing when Rex stopped doesn't continue: re-prompt it.
-- It relies on vibe's undocumented `VIBE_TERMINAL_KEY` and its `continue-pointers` layout (vibe 3.1). If a vibe update changes them, panes come back as plain shells. A custom `session_logging.save_dir` in vibe's config isn't supported.
-- The reopen command goes into your shell history.
-- Needs a Rex that restores sessions: server 0.1.0-preview.11+ on Linux, app 0.1.0-preview.23+ on macOS.
 
 ## Troubleshooting
 
-- `echo $VIBE_TERMINAL_KEY` in a Rex pane should print the pane's `block:…` ID.
-- `ls ~/.local/state/rex-resume` lists one note per pane running vibe.
-- No note right after starting vibe: the pane's shell started before the install. Run `exec zsh`, then `vibe -c`.
+- `rex client ls` lists a client labeled `rex-resume`.
+- `tail ~/.local/state/rex-resume/watcher.log` shows `watching server …`, then a `note` for each vibe, and `resume` or `forget` lines as panes come back or vibe quits.
+- `ls ~/.local/state/rex-resume/panes` holds one record per pane running vibe.
+- If no watcher runs after `rex config reload`, check that `rex` is on the server's `PATH`. With systemd, run `systemctl --user show-environment`.
